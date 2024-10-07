@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@v3
         with: { fetch-depth: 0, submodules: true }
       - name: Build Linux
-        run: docker run -v .:/remote ubuntu:14.04 bash -c 'cd /remote && apt-get update && apt-get install -y gcc-4.8 gcc-4.8-aarch64-linux-gnu && BIN=libremotestream.aarch64-linux.so CC=aarch64-linux-gnu-gcc-4.8 ./build.sh -O3 -std=c99 -D_BSD_SOURCE -D_POSIX_SOURCE && CC=gcc-4.8 BIN=libremotestream.x86_64-linux.so ./build.sh -std=c99 -D_BSD_SOURCE -D_POSIX_SOURCE -O3'
+        run: docker run -v .:/remote ubuntu:14.04 bash -c 'cd /remote && apt-get update && apt-get install -y gcc-4.8 gcc-4.8-aarch64-linux-gnu && BIN=libremotestream.aarch64-linux.so CC=aarch64-linux-gnu-gcc-4.8 ./build.sh -O3 -std=c99 -D_BSD_SOURCE -D_POSIX_SOURCE && rm -f *.o && CC=gcc-4.8 BIN=libremotestream.x86_64-linux.so ./build.sh -std=c99 -D_BSD_SOURCE -D_POSIX_SOURCE -O3'
       - name: Upload Artifacts
         uses: actions/upload-artifact@v3
         with: { name: "Linux", path: "*.so" }
