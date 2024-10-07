@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 : ${CC=gcc}
-: ${BIN=libremote.so}
+: ${BIN=libremotestream.so}
 
 CFLAGS="$CFLAGS -fPIC -Ilib/lite-xl/resources/include"
 LDFLAGS=""
@@ -11,4 +11,4 @@ if [[ ! -e "zstd.o" ]]; then
 fi
 
 [[ "$@" == "clean" ]] && rm -f *.so *.dll *.o && exit 0
-$CC $CFLAGS libremote.c zstd.o $@ -shared -o $BIN $LDFLAGS
+$CC $CFLAGS libremotestream.c zstd.o $@ -shared -o $BIN $LDFLAGS

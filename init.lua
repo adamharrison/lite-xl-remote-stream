@@ -5,7 +5,7 @@ local core = require "core"
 local config = require "core.config"
 local style = require "core.style"
 local common = require "core.common"
-local libremote = require "plugins.remote.libremote"
+local libremote = require "plugins.remote.libremotestream"
 
 local DEFAULT_PORT = 8086
 
