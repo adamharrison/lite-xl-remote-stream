@@ -1,0 +1,4 @@
+zstd.c
+*.o
+*.so
+*.dll

@@ -163,26 +163,36 @@ static int get_font_index(SServer* server, struct RenFont* font) {
 
 
 static int send_compressed_buffer(SDuplex* duplex, EPacketType type, array_t* buffer) {
-  if (!duplex->fd)
+  if (!duplex->fd) {
+    array_clear(buffer);
     return -1;
+  }
   size_t length = array_reserve(&duplex->outgoing_compressed_buffer, ZSTD_compressBound(buffer->length) + sizeof(int) + sizeof(char));
   duplex->outgoing_compressed_buffer.data[0] = type;
   size_t compressed_length = ZSTD_compress(&duplex->outgoing_compressed_buffer.data[sizeof(char) + sizeof(int)], length - sizeof(char) - sizeof(int), buffer->data, buffer->length, 1);
   array_shift(buffer, buffer->length);
   *((int*)&duplex->outgoing_compressed_buffer.data[sizeof(char)]) = compressed_length;
-  int written = write(duplex->fd, duplex->outgoing_compressed_buffer.data, compressed_length + sizeof(char) + sizeof(int));
-  fprintf(stderr, "SENDING: %d %d %lu %lu\n", written, duplex->fd, compressed_length + sizeof(char) + sizeof(int), length);
-  if (written < 0) {
-    close(duplex->fd);
-    duplex->fd = 0;
-  }
-  return length;
+  int written;
+  int to_write_length = compressed_length + sizeof(char) + sizeof(int);
+  int written_length = 0;
+  do {
+    int written = write(duplex->fd, &duplex->outgoing_compressed_buffer.data[written_length], to_write_length - written_length);
+    if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+      close(duplex->fd);
+      duplex->fd = 0;
+      break;
+    } else if (written < 0)
+      usleep(10000);
+    else
+      written_length += written;
+  } while (written_length < to_write_length);
+  return written_length;
 }
 
 static int recv_compressed_buffer(SDuplex* duplex) {
+  if (!duplex->fd)
+    return -1;
   int length = read(duplex->fd, &duplex->incoming_compressed_buffer.data[duplex->incoming_compressed_buffer.length], duplex->incoming_compressed_buffer.capacity - duplex->incoming_compressed_buffer.length);
-  if (length != 0)
-    fprintf(stderr, "LENGTH: %d %lu %d\n", length, duplex->incoming_compressed_buffer.capacity - duplex->incoming_compressed_buffer.length, duplex->fd);
   if (length < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
     close(duplex->fd);
     duplex->fd = 0;
@@ -193,11 +203,18 @@ static int recv_compressed_buffer(SDuplex* duplex) {
   if (duplex->incoming_compressed_buffer.length < sizeof(char) + sizeof(int))
     return 1;
   int total_packet_length = array_reserve(&duplex->incoming_compressed_buffer, *((int*)&duplex->incoming_compressed_buffer.data[sizeof(char)]) + sizeof(char) + sizeof(int));
-  if (total_packet_length - sizeof(char) - sizeof(int) > duplex->incoming_compressed_buffer.length)
-    return 1 ;
+  if (duplex->incoming_compressed_buffer.length < total_packet_length)
+    return 1;
   duplex->incoming_packet_type = *duplex->incoming_compressed_buffer.data;
   size_t decompressed_size = array_reserve(&duplex->incoming_buffer, ZSTD_getFrameContentSize(&duplex->incoming_compressed_buffer.data[sizeof(char) + sizeof(int)], total_packet_length - sizeof(char) - sizeof(int)));
-  duplex->incoming_buffer.length = ZSTD_decompress(duplex->incoming_buffer.data, duplex->incoming_buffer.capacity, &duplex->incoming_compressed_buffer.data[sizeof(char) + sizeof(int)], total_packet_length - sizeof(char) - sizeof(int));
+  size_t decompressed_length = ZSTD_decompress(duplex->incoming_buffer.data, duplex->incoming_buffer.capacity, &duplex->incoming_compressed_buffer.data[sizeof(char) + sizeof(int)], total_packet_length - sizeof(char) - sizeof(int));
+  if (ZSTD_isError(decompressed_length)) {
+    fprintf(stderr, "Error: %d %s\n", decompressed_size, ZSTD_getErrorName(decompressed_length));
+    close(duplex->fd);
+    duplex->fd = 0;
+    return 0;
+  }
+  duplex->incoming_buffer.length = decompressed_length;
   array_shift(&duplex->incoming_compressed_buffer, total_packet_length);
   return 1;
 }
@@ -281,6 +298,15 @@ static int push_command(SRencache* rencache, Command* command) {
   return command->size;
 }
 
+static int f_server_gc(lua_State* L) {
+  SServer* server = lua_touserdata(L, 1);
+  close(server->duplex.fd);
+  free(server->duplex.incoming_buffer.data);
+  free(server->duplex.incoming_compressed_buffer.data);
+  free(server->duplex.outgoing_buffer.data);
+  free(server->duplex.outgoing_compressed_buffer.data);
+}
+
 static int f_server_register_font(lua_State* L) {
   SServer* server = luaL_checkudata(L, 1, "remoteserver");
   const char* path = luaL_checkstring(L, 2);
@@ -292,7 +318,7 @@ static int f_server_register_font(lua_State* L) {
   array_append(&server->registered_fonts, &sfont, sizeof(SFont));
   lua_pushvalue(L, 2);
   lua_pushvalue(L, 3);
-  lua_pushinteger(L, array_length(&server->registered_fonts));
+  lua_pushinteger(L, sfont.index);
   lua_pushvalue(L, 5);
   lua_pushvalue(L, 6);
   push_lua(L, 5, &server->duplex.outgoing_buffer);
@@ -309,8 +335,11 @@ static int f_server_begin_frame(lua_State* L) {
 
 static int f_server_end_frame(lua_State* L) {
   SServer* server = luaL_checkudata(L, 1, "remoteserver");
-  if (server->rencache.checksum != server->previous_rencache_checksum) {
+  if (server->rencache.checksum != server->previous_rencache_checksum && server->duplex.fd) {
+    int flags = fcntl(server->duplex.fd, F_GETFL, 0);
+    fcntl(server->duplex.fd, F_SETFL, flags & ~O_NONBLOCK);
     send_compressed_buffer(&server->duplex, PACKET_COMMAND_BUFFER, &server->rencache.buffer);
+    fcntl(server->duplex.fd, F_SETFL, flags | O_NONBLOCK);
     server->previous_rencache_checksum = server->rencache.checksum;
     lua_pushboolean(L, 1);
   } else 
@@ -389,34 +418,36 @@ static int f_server_draw_rect(lua_State* L) {
 
 static int f_server_draw_text(lua_State* L) {
   SServer* server = luaL_checkudata(L, 1, "remoteserver");
-  int fonts[FONT_FALLBACK_MAX];
-  if (lua_type(L, 1) != LUA_TTABLE) {
-    struct RenFont* font = *(struct RenFont**)lua_touserdata(L, 2);
-    fonts[0] = get_font_index(server, font);
-    if (fonts[0] == -1)
-      return luaL_error(L, "can't find unregistered font");
-  } else {
-    int len = luaL_len(L, 1); len = len > FONT_FALLBACK_MAX ? FONT_FALLBACK_MAX : len;
-    for (int i = 0; i < len; i++) {
-      lua_rawgeti(L, 1, i+1);
-      struct RenFont* font = *(struct RenFont**)lua_touserdata(L, -1);
-      fonts[i] = get_font_index(server, font);
-      if (fonts[i] == -1)
+  if (server->duplex.fd) {
+    int fonts[FONT_FALLBACK_MAX];
+    if (lua_type(L, 1) != LUA_TTABLE) {
+      struct RenFont* font = *(struct RenFont**)lua_touserdata(L, 2);
+      fonts[0] = get_font_index(server, font);
+      if (fonts[0] == -1)
         return luaL_error(L, "can't find unregistered font");
-      lua_pop(L, 1);
+    } else {
+      int len = luaL_len(L, 1); len = len > FONT_FALLBACK_MAX ? FONT_FALLBACK_MAX : len;
+      for (int i = 0; i < len; i++) {
+        lua_rawgeti(L, 1, i+1);
+        struct RenFont* font = *(struct RenFont**)lua_touserdata(L, -1);
+        fonts[i] = get_font_index(server, font);
+        if (fonts[i] == -1)
+          return luaL_error(L, "can't find unregistered font");
+        lua_pop(L, 1);
+      }
     }
+    size_t len;
+    const char *text = luaL_checklstring(L, 3, &len);
+    double x = luaL_checknumber(L, 4);
+    int y = luaL_checknumber(L, 5);
+    RenColor color = checkcolor(L, 6, 255);
+    static array_t cmd_array = {0};
+    array_reserve(&cmd_array, sizeof(DrawTextCommand) + len);
+    DrawTextCommand* cmd = (DrawTextCommand*)cmd_array.data;
+    *cmd = (DrawTextCommand){ { .type = DRAW_TEXT, .size = sizeof(DrawTextCommand) + len }, .color = color, .fonts = *fonts, .text_x = x, .y = y, .len = len, .tab_size = 2 };
+    memcpy(&cmd->text, text, len);
+    push_command(&server->rencache, (Command*)cmd);
   }
-  size_t len;
-  const char *text = luaL_checklstring(L, 3, &len);
-  double x = luaL_checknumber(L, 4);
-  int y = luaL_checknumber(L, 5);
-  RenColor color = checkcolor(L, 6, 255);
-  static array_t cmd_array = {0};
-  array_reserve(&cmd_array, sizeof(DrawTextCommand) + len);
-  DrawTextCommand* cmd = (DrawTextCommand*)cmd_array.data;
-  *cmd = (DrawTextCommand){ { .type = DRAW_TEXT, .size = sizeof(DrawTextCommand) + len }, .color = color, .fonts = *fonts, .text_x = x, .y = y, .len = len, .tab_size = 2 };
-  memcpy(&cmd->text, text, len);
-  push_command(&server->rencache, (Command*)cmd);
   return 0;
 }
 
@@ -433,6 +464,7 @@ static int f_server_accept(lua_State* L) {
   server->listening = 0;
   int flags = fcntl(server->duplex.fd, F_GETFL, 0);
   fcntl(server->duplex.fd, F_SETFL, flags | O_NONBLOCK);
+  lua_pushstring(L, inet_ntoa(peer_addr.sin_addr));
   return 1;
 }
 
@@ -447,15 +479,7 @@ static int f_server_is_open(lua_State* L) {
 static int f_server_wait_event(lua_State* L) {
   SServer* server = luaL_checkudata(L, 1, "remoteserver");
   if (server->duplex.fd) {
-    double timeout = lua_isnil(L, 2) ? 999999.0 : luaL_checknumber(L, 2);
-    struct timeval tv;
-    tv.tv_sec = floor(timeout);
-    tv.tv_usec = floor(fmod(timeout, 1.0) * 100000);
-    setsockopt(server->duplex.fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
-    int flags = fcntl(server->duplex.fd, F_GETFL, 0);
-    fcntl(server->duplex.fd, F_SETFL, flags & ~O_NONBLOCK);
-    lua_pushboolean(L, recv_compressed_buffer(&server->duplex));
-    fcntl(server->duplex.fd, F_SETFL, flags | O_NONBLOCK);
+    lua_pushboolean(L, server->duplex.incoming_packet_type != PACKET_NONE || recv_compressed_buffer(&server->duplex));
     return 1; 
   }
   return 0;
@@ -463,8 +487,17 @@ static int f_server_wait_event(lua_State* L) {
 
 static int f_server_poll_event(lua_State* L) {
   SServer* server = luaL_checkudata(L, 1, "remoteserver");
-  recv_compressed_buffer(&server->duplex);
-  return pull_lua(L, &server->duplex.incoming_buffer);
+  if (server->duplex.fd) {
+    if (server->duplex.incoming_packet_type == PACKET_NONE)
+      recv_compressed_buffer(&server->duplex);
+    if (server->duplex.incoming_packet_type != PACKET_NONE) {
+      int n = pull_lua(L, &server->duplex.incoming_buffer);
+      array_clear(&server->duplex.incoming_buffer);
+      server->duplex.incoming_packet_type = PACKET_NONE;
+      return n;
+    }
+  }
+  return 0;
 }
 
 
@@ -477,20 +510,29 @@ static int f_server_send_event(lua_State* L) {
 
 
 static const luaL_Reg server[] = {
-  { "begin_frame",        f_server_begin_frame        },
-  { "end_frame",          f_server_end_frame          },
-  { "set_clip_rect",      f_server_set_clip_rect      },
-  { "draw_rect",          f_server_draw_rect          },
-  { "draw_text",          f_server_draw_text          },
-  { "register_font",      f_server_register_font      },
-  { "accept",             f_server_accept             },
-  { "wait_event",         f_server_wait_event         },
-  { "poll_event",         f_server_poll_event         },
-  { "send_event",         f_server_send_event         },
-  { "is_open",            f_server_is_open            },
-  { NULL,                 NULL                        }
+  { "__gc",          f_server_gc            },
+  { "begin_frame",   f_server_begin_frame   },
+  { "end_frame",     f_server_end_frame     },
+  { "set_clip_rect", f_server_set_clip_rect },
+  { "draw_rect",     f_server_draw_rect     },
+  { "draw_text",     f_server_draw_text     },
+  { "register_font", f_server_register_font },
+  { "accept",        f_server_accept        },
+  { "wait_event",    f_server_wait_event    },
+  { "poll_event",    f_server_poll_event    },
+  { "send_event",    f_server_send_event    },
+  { "is_open",       f_server_is_open       },
+  { NULL,            NULL                   }
 };
 
+static int f_client_gc(lua_State* L) {
+  SClient* client = lua_touserdata(L, 1);
+  close(client->duplex.fd);
+  free(client->duplex.incoming_buffer.data);
+  free(client->duplex.incoming_compressed_buffer.data);
+  free(client->duplex.outgoing_buffer.data);
+  free(client->duplex.outgoing_compressed_buffer.data);
+}
 
 static int f_client_is_open(lua_State* L) {
   SClient* client = luaL_checkudata(L, 1, "remoteclient");
@@ -519,9 +561,14 @@ static void lua_pushcolor(lua_State* L, RenColor color) {
 
 static int f_client_has_event(lua_State* L) {
   SClient* client = luaL_checkudata(L, 1, "remoteclient");
-  if (client->duplex.incoming_packet_type == PACKET_NONE)
+  if (client->duplex.incoming_packet_type == PACKET_NONE && client->duplex.fd)
     recv_compressed_buffer(&client->duplex);
   lua_pushboolean(L, client->duplex.incoming_packet_type != PACKET_NONE);
+  if (client->duplex.incoming_packet_type != PACKET_NONE) {
+    FILE* file = fopen("/tmp/wat", "wb");
+    fwrite(client->duplex.incoming_buffer.data, sizeof(char), client->duplex.incoming_buffer.length, file);
+    fclose(file);
+  }
   return 1;
 }
 
@@ -596,12 +643,14 @@ static int f_client_process_event(lua_State* L) {
     } break;
     case PACKET_EVENT:
       result_count = pull_lua(L, result);
+    break;
   }
   client->duplex.incoming_packet_type = PACKET_NONE;
   return result_count;
 }
 
 static const luaL_Reg client[] = {
+  { "__gc",              f_client_gc                  },
   { "send_event",        f_client_send_event          },
   { "process_event",     f_client_process_event       },
   { "has_event",         f_client_has_event           },
@@ -621,10 +670,12 @@ static int f_server(lua_State* L) {
   setsockopt(server->listening, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
   if (!server->listening)
     return luaL_error(L, "can't create socket: %s", strerror(errno));
-  struct sockaddr_in host_addr = {0}, peer_addr = {0};
+  struct sockaddr_in host_addr = {0};
   host_addr.sin_addr.s_addr = hostname ? inet_addr(hostname) : INADDR_ANY;
   host_addr.sin_port = htons(port);
   host_addr.sin_family = AF_INET;  
+  array_reserve(&server->duplex.incoming_compressed_buffer, 4096);
+  array_reserve(&server->duplex.outgoing_compressed_buffer, 4096);
   if (bind(server->listening, (struct sockaddr*)&host_addr, sizeof(host_addr)) == -1)
     return luaL_error(L, "can't bind: %s", strerror(errno));
   if (listen(server->listening, 1) == -1)
